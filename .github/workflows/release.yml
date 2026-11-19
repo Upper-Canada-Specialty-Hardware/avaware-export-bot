@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  # Installed apps update themselves from the exe and checksum this attaches to each published release.
+  # Cut a release with: gh release create vX.Y.Z --generate-notes
+  release:
+    types: [published]
+
+permissions:
+  contents: write # attach the assets to the release
+
+jobs:
+  publish:
+    name: Publish
+    # Linux: the Windows desktop app cross-publishes here through EnableWindowsTargeting; nothing needs Windows to run.
+    runs-on: ${{ vars.UCSH_LINUX || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Check the tag
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$TAG' is not vX.Y.Z (for example v1.2.3). Delete the release and publish it again with a vX.Y.Z tag."
+            exit 1
+          fi
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+
+      - name: Restore
+        run: dotnet restore --locked-mode
+
+      - name: Test
+        run: dotnet test --no-restore -c Release
+
+      - name: Publish
+        run: >
+          dotnet publish src/AvawareExportBot.App --no-restore -c Release -r win-x64 --self-contained false
+          -p:PublishSingleFile=true -p:Version=${VERSION} -p:AutoUpdateBuild=true -o publish
+
+      - name: Checksum
+        working-directory: publish
+        run: sha256sum AvawareExportBot.exe > AvawareExportBot.exe.sha256 && cat AvawareExportBot.exe.sha256
+
+      - name: Attach to the release
+        working-directory: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" AvawareExportBot.exe AvawareExportBot.exe.sha256 --clobber --repo "$GITHUB_REPOSITORY"

@@ -33,3 +33,9 @@ jobs:
 
       - name: Test
         run: dotnet test --no-build -c Release --verbosity normal
+
+      # The same publish the release workflow runs, so a release is never the first time it is tried.
+      - name: Publish
+        run: >
+          dotnet publish src/AvawareExportBot.App --no-restore -c Release -r win-x64 --self-contained false
+          -p:PublishSingleFile=true -p:Version=0.0.0 -o publish

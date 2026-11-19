@@ -40,5 +40,18 @@ public sealed class SettingsTests : IDisposable
         Assert.Empty(new Settings().Validate(_ => true, _ => true));
     }
 
+    [Fact]
+    public void Auto_update_is_on_by_default_and_for_a_settings_file_from_before_it_existed()
+    {
+        Assert.True(new Settings().AutoUpdate);
+        var path = _dir.Combine("old-settings.json");
+        File.WriteAllText(path, """{ "RootFolder": "T:\\", "Workers": 2 }""");
+        Assert.True(Settings.Load(path).AutoUpdate);
+
+        var off = new Settings { AutoUpdate = false };
+        off.Save(path);
+        Assert.False(Settings.Load(path).AutoUpdate);
+    }
+
     public void Dispose() => _dir.Dispose();
 }
