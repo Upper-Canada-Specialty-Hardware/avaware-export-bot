@@ -4,6 +4,8 @@
   <PropertyGroup>
     <TargetFramework>net7.0-windows</TargetFramework>
     <UseWindowsForms>false</UseWindowsForms>
+    <!-- As in Core: the app's win-x64 release restores this for win-x64, so the lock file always covers it. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
