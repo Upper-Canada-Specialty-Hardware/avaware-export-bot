@@ -12,8 +12,8 @@ jobs:
   build:
     name: Build
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    # Linux: Core is platform neutral, and the Windows projects build here through EnableWindowsTargeting.
-    # Nothing in CI needs AVAproject or a desktop, so no Windows runner is used.
+    # Linux: Core is platform neutral, and the Windows projects compile here through EnableWindowsTargeting.
+    # Nothing in the tests needs AVAproject or a desktop. The release exe itself is built by Release build below.
     runs-on: ${{ vars.UCSH_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -38,8 +38,31 @@ jobs:
       - name: Test the release version script
         run: bash .github/scripts/next-version.test.sh
 
-      # The same publish the release workflow runs, so a release is never the first time it is tried.
+
+  # The same publish and exe check the release workflow runs, so a release is never the first time they are tried.
+  release-build:
+    name: Release build
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    # Windows: the SDK finishes the exe (GUI subsystem, version resource) only on Windows; on Linux it comes out a
+    # console program with no version (NETSDK1074). The tests stay on Linux in Build.
+    runs-on: ${{ vars.UCSH_WINDOWS || 'windows-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+
+      - name: Restore
+        run: dotnet restore --locked-mode
+
       - name: Publish
         run: >
           dotnet publish src/AvawareExportBot.App --no-restore -c Release -r win-x64 --self-contained false
           -p:PublishSingleFile=true -p:Version=0.0.0 -o publish
+
+      - name: Check the exe
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/check-exe.ps1 -Exe publish/AvawareExportBot.exe -Version 0.0.0

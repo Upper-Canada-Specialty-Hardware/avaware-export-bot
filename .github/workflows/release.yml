@@ -20,9 +20,13 @@ concurrency:
 jobs:
   publish:
     name: Publish
-    # Linux: the Windows desktop app cross-publishes here through EnableWindowsTargeting; nothing needs Windows to run.
-    runs-on: ${{ vars.UCSH_LINUX || 'ubuntu-latest' }}
+    # Windows: the SDK finishes the exe (GUI subsystem, version resource) only on Windows. Built on Linux it
+    # compiles but comes out a console program with no version (NETSDK1074), which is what v0.1.0 shipped as.
+    runs-on: ${{ vars.UCSH_WINDOWS || 'windows-latest' }}
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash # Git Bash on the Windows runner, for the version script, git, sha256sum and gh
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,6 +80,13 @@ jobs:
         run: >
           dotnet publish src/AvawareExportBot.App --no-restore -c Release -r win-x64 --self-contained false
           -p:PublishSingleFile=true -p:Version=${VERSION} -p:AutoUpdateBuild=true -o publish
+
+      # Nothing is published unless the exe is a GUI program carrying this version.
+      - name: Check the exe
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/check-exe.ps1 -Exe publish/AvawareExportBot.exe -Version "$VERSION"
 
       - name: Checksum
         if: steps.version.outputs.skip != 'true'
