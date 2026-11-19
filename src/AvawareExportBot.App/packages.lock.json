@@ -70,7 +70,7 @@
       "avawareexportbot.automation": {
         "type": "Project",
         "dependencies": {
-          "AvawareExportBot.Core": "[1.0.0, )",
+          "AvawareExportBot.Core": "[0.0.0, )",
           "System.Drawing.Common": "[7.0.0, )"
         }
       },
@@ -78,6 +78,26 @@
         "type": "Project",
         "dependencies": {
           "Microsoft.Data.Sqlite": "[7.0.20, )"
+        }
+      }
+    },
+    "net7.0-windows7.0/win-x64": {
+      "Microsoft.Win32.SystemEvents": {
+        "type": "Transitive",
+        "resolved": "7.0.0",
+        "contentHash": "2nXPrhdAyAzir0gLl8Yy8S5Mnm/uBSQQA7jEsILOS1MTyS7DbmV1NgViMtvV1sfCD1ebITpNwb1NIinKeJgUVQ=="
+      },
+      "SQLitePCLRaw.lib.e_sqlite3": {
+        "type": "Transitive",
+        "resolved": "2.1.4",
+        "contentHash": "2C9Q9eX7CPLveJA0rIhf9RXAvu+7nWZu1A2MdG6SD/NOu26TakGgL1nsbc0JAspGijFOo3HoN79xrx8a368fBg=="
+      },
+      "System.Drawing.Common": {
+        "type": "Transitive",
+        "resolved": "7.0.0",
+        "contentHash": "KIX+oBU38pxkKPxvLcLfIkOV5Ien8ReN78wro7OF5/erwcmortzeFx+iBswlh2Vz6gVne0khocQudGwaO1Ey6A==",
+        "dependencies": {
+          "Microsoft.Win32.SystemEvents": "7.0.0"
         }
       }
     }

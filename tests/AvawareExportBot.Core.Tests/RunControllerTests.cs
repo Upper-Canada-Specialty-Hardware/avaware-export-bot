@@ -312,6 +312,82 @@ public sealed class RunControllerTests : IDisposable
         Assert.NotNull(snap.LastScanFinishedUtc);
     }
 
+    [Fact]
+    public void Update_hold_starts_nothing_new_and_drains_the_running_exports()
+    {
+        Files(5);
+        _c.Start();
+        Step();
+        Assert.Equal(2, _runner.Calls.Count);
+
+        _c.UpdateHold = true;
+        _runner.Finish(0, ExportOutcome.Ok(TimeSpan.FromSeconds(1)));
+        Step();
+        Assert.Equal(2, _runner.Calls.Count); // the free slot stays free
+        Assert.False(_c.IsDrained);            // one export is still running, so the update must wait
+
+        _runner.Finish(1, ExportOutcome.Ok(TimeSpan.FromSeconds(1)));
+        Step();
+        Assert.True(_c.IsDrained);
+        Assert.Equal(2, _runner.Calls.Count);
+        Assert.True(_c.Snapshot().UpdateHold);
+
+        Step(TimeSpan.FromMinutes(_settings.RescanMinutes + 1));
+        Assert.Equal(1, _scanner.Runs); // no scan starts during the hold either
+    }
+
+    [Fact]
+    public void Update_hold_leaves_the_users_state_alone_and_lifting_it_resumes()
+    {
+        Files(5);
+        _c.UpdateHold = true;
+        _c.Start();
+        Step();
+        Assert.Equal(RunState.Running, _c.State);
+        Assert.Empty(_runner.Calls);
+        _c.Pause();
+        Assert.Equal(RunState.Armed, _c.State);
+        _c.Stop();
+        Assert.Equal(RunState.Stopped, _c.State);
+
+        _c.Start();
+        _c.UpdateHold = false;
+        Step();
+        Assert.Equal(2, _runner.Calls.Count);
+    }
+
+    [Fact]
+    public void Drained_means_no_export_and_no_scan()
+    {
+        Assert.True(_c.IsDrained);
+        Files(1);
+        _c.Start();
+        Step();
+        Assert.False(_c.IsDrained);
+        _runner.Finish(0, ExportOutcome.Ok(TimeSpan.FromSeconds(1)));
+        Assert.True(_c.IsDrained);
+    }
+
+    [Theory]
+    [InlineData(RunState.Running, RunState.Running)]
+    [InlineData(RunState.Stopped, RunState.Stopped)]
+    [InlineData(RunState.IdleRunning, RunState.Armed)]
+    public void An_updated_app_starts_in_the_state_it_was_given(RunState given, RunState expected)
+    {
+        var c = new RunController(_store, _runner, _scanner, _idle, _clock, _log, () => _settings, given);
+        Assert.Equal(expected, c.State);
+    }
+
+    [Fact]
+    public void An_updated_app_started_running_exports_straight_away()
+    {
+        Files(3);
+        var c = new RunController(_store, _runner, _scanner, _idle, _clock, _log, () => _settings, RunState.Running);
+        _clock.Advance(RunController.IdlePoll);
+        c.Tick();
+        Assert.Equal(2, _runner.Calls.Count);
+    }
+
     public void Dispose()
     {
         _store.Dispose();

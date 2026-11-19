@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using AvawareExportBot.Core;
+using AvawareExportBot.Core.Updates;
 
 namespace AvawareExportBot.App;
 
@@ -28,16 +29,32 @@ public sealed class MainForm : Form
     private readonly ListView _failures = MakeList(("File", 300), ("Folder", 300), ("Attempts", 70), ("Last error", 420), ("Last attempt", 130));
     private readonly NotifyIcon _tray = new() { Icon = SystemIcons.Application, Text = "Avaware Export Bot", Visible = true };
     private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 1000 };
+    private readonly ToolStripStatusLabel _versionLabel = new();
+    private readonly ToolStripStatusLabel _updateLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
 
     private long _logSequence = -1;
     private DateTime _lastListLoad = DateTime.MinValue;
     private int _listLoading;
     private bool _hadWork;
     private bool _exiting;
+    private bool _startHidden;
+    private string? _startupNotice;
 
-    public MainForm(AppHost host)
+    public MainForm(AppHost host, RestartArgs start)
     {
         _host = host;
+        _startHidden = start.Tray;
+        var version = AppVersion.Format(AppInfo.Version);
+        if (start.UpdatedFrom is not null)
+        {
+            _startupNotice = $"Updated from {AppVersion.Format(start.UpdatedFrom)} to {version}.";
+            host.Log.Info(_startupNotice);
+        }
+        else if (start.UpdateFailed is not null)
+        {
+            _startupNotice = $"Update {AppVersion.Format(start.UpdateFailed)} failed to start; still on {version}. It won't be tried again.";
+            host.Log.Error(_startupNotice);
+        }
         Text = "Avaware Export Bot";
         Icon = SystemIcons.Application;
         MinimumSize = new Size(900, 600);
@@ -66,12 +83,21 @@ public sealed class MainForm : Form
         layout.Controls.Add(_counters, 0, 1);
         layout.Controls.Add(workersBox, 0, 2);
         layout.Controls.Add(tabs, 0, 3);
+        var status = new StatusStrip { SizingGrip = true };
+        _versionLabel.Text = $"Version {version}";
+        status.Items.AddRange(new ToolStripItem[] { _versionLabel, _updateLabel });
         Controls.Add(layout);
+        Controls.Add(status);
+        layout.BringToFront(); // the filling control docks last, after the status strip takes the bottom
 
         _start.Click += (_, _) => { _host.Controller.Start(); RefreshNow(); };
         _pause.Click += (_, _) => { _host.Controller.Pause(); RefreshNow(); };
         _stop.Click += (_, _) => { _host.Controller.Stop(); RefreshNow(); };
         _settingsButton.Click += (_, _) => OpenSettings();
+        _host.UpdateReadyToApply += staged =>
+        {
+            try { BeginInvoke(() => _ = ApplyUpdateAsync(staged)); } catch (InvalidOperationException) { }
+        };
 
         BuildTray();
         _uiTimer.Tick += (_, _) => RefreshNow();
@@ -171,9 +197,33 @@ public sealed class MainForm : Form
         menu.Items.Add("Pause", null, (_, _) => _host.Controller.Pause());
         menu.Items.Add("Stop", null, (_, _) => _host.Controller.Stop());
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Check for updates", null, async (_, _) => await CheckForUpdatesAsync());
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, async (_, _) => await ExitAsync());
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        void Balloon(string text)
+        {
+            try { BeginInvoke(() => _tray.ShowBalloonTip(5000, "Avaware Export Bot", text, ToolTipIcon.Info)); }
+            catch (InvalidOperationException) { }
+        }
+        Balloon(await _host.Updates.CheckNowAsync(Balloon));
+    }
+
+    /// <summary>The first time the form is asked to show itself, a start in the tray keeps it hidden.</summary>
+    protected override void SetVisibleCore(bool value)
+    {
+        if (_startHidden)
+        {
+            _startHidden = false;
+            if (!IsHandleCreated) CreateHandle();
+            value = false;
+        }
+        base.SetVisibleCore(value);
     }
 
     public void ShowFromTray()
@@ -201,6 +251,21 @@ public sealed class MainForm : Form
             RunState.IdleRunning => "Running (idle): stops starting new exports on your next input",
             _ => snap.State.ToString(),
         };
+        var holdingFor = _host.HoldingFor;
+        if (snap.UpdateHold && holdingFor is not null)
+        {
+            var running = snap.Workers.Count(w => w.ApjPath is not null);
+            _stateLabel.Text = $"Updating to {AppVersion.Format(holdingFor.Version)}: waiting for {running} export(s) to finish";
+        }
+        _updateLabel.Text = !_host.Updates.ReleaseBuild ? "Dev build, updates off"
+            : holdingFor is not null ? $"Update {AppVersion.Format(holdingFor.Version)} ready: applies when no export is running"
+            : _host.Updates.Staged is { } staged ? $"Update {AppVersion.Format(staged.Version)} downloaded; automatic updates are off"
+            : $"Updates: {_host.Updates.Status}";
+        if (_startupNotice is not null)
+        {
+            _tray.ShowBalloonTip(8000, "Avaware Export Bot", _startupNotice, ToolTipIcon.Info);
+            _startupNotice = null;
+        }
 
         var c = snap.Counts;
         var scan = snap.Scanning
@@ -343,6 +408,24 @@ public sealed class MainForm : Form
         }
         SaveBounds();
         base.OnFormClosing(e);
+    }
+
+    /// <summary>
+    /// Nothing is running and an update is staged: shut the app down and hand the swap to Program, which restarts
+    /// the new exe in the same state and with the window shown or hidden as now.
+    /// </summary>
+    private async Task ApplyUpdateAsync(StagedUpdate staged)
+    {
+        if (_exiting) return; // the user is exiting already; the staged update applies at the next launch
+        _exiting = true;
+        _uiTimer.Stop();
+        var restart = new RestartArgs(_host.Controller.State, Tray: !Visible);
+        _host.Log.Info($"Applying update {AppVersion.Format(staged.Version)}: restarting {restart.State}{(restart.Tray ? " in the tray" : "")}.");
+        _host.PendingUpdate = new PendingUpdate(staged, restart);
+        UseWaitCursor = true;
+        await _host.ShutdownAsync();
+        _tray.Visible = false;
+        Close();
     }
 
     private async Task ExitAsync()

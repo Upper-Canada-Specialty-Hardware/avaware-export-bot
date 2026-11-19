@@ -3,6 +3,10 @@
   <!-- Platform-neutral logic: scanner, state store, run controller, settings. No Windows APIs, so its tests run on Linux. -->
   <PropertyGroup>
     <TargetFramework>net7.0</TargetFramework>
+    <!-- The app's win-x64 release restores this project for win-x64 too. Listing it here keeps the lock file the same
+         however the project is restored (alone or through the app), so a locked restore never sees it change.
+         Restore only: the build stays portable, and the tests still run on Linux. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>

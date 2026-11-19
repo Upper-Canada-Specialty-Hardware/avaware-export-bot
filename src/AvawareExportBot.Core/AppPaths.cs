@@ -20,6 +20,8 @@ public sealed class AppPaths
     public string LogsDir => Path.Combine(DataDir, "logs");
     public string SnapsDir => Path.Combine(LogsDir, "snaps");
     public string WorkDir => Path.Combine(DataDir, "work");
+    public string UpdatesDir => Path.Combine(DataDir, "updates");
+    public string UpdateStateFile => Path.Combine(DataDir, "update.json");
 
     public void EnsureCreated()
     {
