@@ -49,13 +49,26 @@ public sealed class Settings
         try
         {
             if (File.Exists(path))
-                return JsonSerializer.Deserialize<Settings>(File.ReadAllText(path)) ?? new Settings();
+                return (JsonSerializer.Deserialize<Settings>(File.ReadAllText(path)) ?? new Settings()).Normalized();
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
             // Fall back to defaults; a broken settings file must not stop the app.
         }
         return new Settings();
+    }
+
+    /// <summary>A hand-edited file can hold anything: numbers are clamped into range, blank paths get their defaults.</summary>
+    public Settings Normalized()
+    {
+        var s = Clone();
+        if (string.IsNullOrWhiteSpace(s.RootFolder)) s.RootFolder = DefaultRoot;
+        if (string.IsNullOrWhiteSpace(s.AvaprojectExe)) s.AvaprojectExe = DefaultAvaprojectExe;
+        s.Workers = Math.Clamp(s.Workers, 1, MaxWorkers);
+        s.IdleMinutes = Math.Clamp(s.IdleMinutes, 1, 24 * 60);
+        s.RescanMinutes = Math.Clamp(s.RescanMinutes, 1, 7 * 24 * 60);
+        s.MaxAttempts = Math.Clamp(s.MaxAttempts, 1, 100);
+        return s;
     }
 
     public void Save(string path)

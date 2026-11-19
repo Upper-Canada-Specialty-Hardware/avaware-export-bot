@@ -32,8 +32,7 @@ public sealed class MainForm : Form
     private long _logSequence = -1;
     private DateTime _lastListLoad = DateTime.MinValue;
     private int _listLoading;
-    private int _lastPending = -1;
-    private bool _balloonShown;
+    private bool _hadWork;
     private bool _exiting;
 
     public MainForm(AppHost host)
@@ -233,14 +232,14 @@ public sealed class MainForm : Form
 
         if (now - _lastListLoad >= TimeSpan.FromSeconds(5)) LoadListsInBackground(snap);
 
-        // One balloon when a pass of the backlog completes.
-        if (_lastPending > 0 && c.Pending == 0 && c.Exporting == 0 && !snap.Scanning && !_balloonShown)
+        // One balloon when a pass of the backlog completes: work was outstanding, and now nothing is pending or exporting.
+        var outstanding = c.Pending + c.Exporting;
+        if (outstanding > 0) _hadWork = true;
+        else if (_hadWork && !snap.Scanning)
         {
             _tray.ShowBalloonTip(5000, "Avaware Export Bot", $"Backlog done: {c.Done:N0} exported, {c.Failed:N0} failed.", ToolTipIcon.Info);
-            _balloonShown = true;
+            _hadWork = false;
         }
-        if (c.Pending > 0) _balloonShown = false;
-        _lastPending = c.Pending;
     }
 
     private void RefreshLog()
@@ -330,6 +329,17 @@ public sealed class MainForm : Form
             e.Cancel = true; // closing the window hides it to the tray; Exit is in the tray menu
             Hide();
             return;
+        }
+        if (!_exiting)
+        {
+            // Logoff, shutdown, End task, Application.Exit: the same shutdown as Exit (cancel, kill AVAproject, rows back
+            // to pending), waiting at most 20 s. Run off the UI thread so nothing it awaits can need this thread.
+            _exiting = true;
+            _uiTimer.Stop();
+            _host.Log.Info($"Closing ({e.CloseReason}).");
+            try { Task.Run(() => _host.ShutdownAsync()).Wait(TimeSpan.FromSeconds(20)); }
+            catch (AggregateException ex) { _host.Log.Error("Shutdown failed: " + ex.GetBaseException().Message); }
+            _tray.Visible = false;
         }
         SaveBounds();
         base.OnFormClosing(e);

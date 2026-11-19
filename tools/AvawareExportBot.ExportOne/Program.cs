@@ -27,9 +27,16 @@ var thread = new Thread(() =>
 {
     using var desktop = new HiddenDesktop($"avaware-export-one-{worker}");
     desktop.AttachCurrentThread();
-    var exporter = new AvaprojectExporter(desktop, settings.AvaprojectExe, Path.Combine(paths.WorkDir, "one-" + worker), paths.SnapsDir);
-    var step = new StepPrinter();
-    outcome = exporter.Export(apj, target, step, cts.Token);
+    var userDesktop = AvaprojectExporter.OpenUserDesktop();
+    try
+    {
+        var exporter = new AvaprojectExporter(desktop, userDesktop, settings.AvaprojectExe, Path.Combine(paths.WorkDir, "one-" + worker), paths.SnapsDir);
+        outcome = exporter.Export(apj, target, new StepPrinter(), cts.Token);
+    }
+    finally
+    {
+        AvaprojectExporter.CloseUserDesktop(userDesktop);
+    }
 });
 outcome = ExportOutcome.Fail("did not run", TimeSpan.Zero);
 thread.Start();

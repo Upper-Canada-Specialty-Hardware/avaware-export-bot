@@ -93,7 +93,11 @@ public sealed class FakeScanner : IScanRunner
     private readonly FakeClock _clock;
     public int Runs { get; private set; }
     public List<ScannedApj> NextResult { get; set; } = new();
+    /// <summary>Record an incomplete scan that saw nothing (root unreadable).</summary>
     public bool Fail { get; set; }
+
+    /// <summary>Throw instead of returning a result.</summary>
+    public bool Throw { get; set; }
 
     public FakeScanner(StateStore store, FakeClock clock)
     {
@@ -104,10 +108,16 @@ public sealed class FakeScanner : IScanRunner
     public Task<ScanResult> RunAsync(IProgress<ScanProgress> progress, CancellationToken ct)
     {
         Runs++;
-        if (Fail) return Task.FromException<ScanResult>(new IOException("share unavailable"));
+        if (Throw) return Task.FromException<ScanResult>(new IOException("scanner crashed"));
         var id = _store.BeginScan(_clock.UtcNow);
+        if (Fail)
+        {
+            // Like the real scanner when the root can't be read: an incomplete scan that saw nothing.
+            _store.FinishScan(id, _clock.UtcNow, 0, 0, Array.Empty<string>(), completed: false);
+            return Task.FromResult(new ScanResult(id, 0, 0, 0, false, _clock.UtcNow));
+        }
         _store.UpsertSeen(id, NextResult, _clock.UtcNow);
-        _store.FinishScan(id, _clock.UtcNow, NextResult.Count, NextResult.Count(r => !r.HasMdb), 0, completed: true);
+        _store.FinishScan(id, _clock.UtcNow, NextResult.Count, NextResult.Count(r => !r.HasMdb), Array.Empty<string>(), completed: true);
         return Task.FromResult(new ScanResult(id, NextResult.Count, NextResult.Count(r => !r.HasMdb), 0, true, _clock.UtcNow));
     }
 }

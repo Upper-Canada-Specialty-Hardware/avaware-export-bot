@@ -23,13 +23,16 @@ internal static class Program
         ApplicationConfiguration.Initialize();
         using var host = new AppHost(AppPaths.Default);
         using var form = new MainForm(host);
+        // Create the window handle now, before the listener can call BeginInvoke on it.
+        _ = form.Handle;
 
         var listener = new Thread(() =>
         {
             while (showEvent.WaitOne())
             {
                 if (form.IsDisposed) return;
-                try { form.BeginInvoke(form.ShowFromTray); } catch (InvalidOperationException) { return; }
+                // A show that cannot be delivered right now is skipped; the listener keeps running for the next launch.
+                try { form.BeginInvoke(form.ShowFromTray); } catch (InvalidOperationException) { }
             }
         }) { IsBackground = true, Name = "show-listener" };
         listener.Start();

@@ -168,9 +168,11 @@ public sealed class RunControllerTests : IDisposable
         _c.Start();
         for (var attempt = 1; attempt <= 3; attempt++)
         {
-            Step();
+            Step(attempt == 1 ? null : TimeSpan.FromMinutes(_settings.RescanMinutes));
             Assert.Equal(attempt, _runner.Calls.Count);
             _runner.Finish(attempt - 1, ExportOutcome.Fail("boom", TimeSpan.Zero));
+            Step();
+            Assert.Equal(attempt, _runner.Calls.Count); // not retried back to back
         }
         var row = _store.Get(@"T:\p0.apj")!;
         Assert.Equal(FileStatus.Failed, row.Status);
@@ -230,8 +232,56 @@ public sealed class RunControllerTests : IDisposable
         Assert.Equal(2, _scanner.Runs);
         Step();
         Assert.Equal(2, _scanner.Runs);
-        Assert.Equal(2, _store.GetCounts().Total);
-        Assert.Contains(_log.Lines, l => l.StartsWith("ERROR") && l.Contains("share unavailable"));
+        Assert.Equal(2, _store.GetCounts().Total); // an incomplete scan that saw nothing deletes nothing
+    }
+
+    [Fact]
+    public void Scanner_exception_is_logged_and_waits_for_the_interval()
+    {
+        Files(1);
+        _scanner.Throw = true;
+        _c.Start();
+        Step();
+        Step();
+        Assert.Equal(1, _scanner.Runs);
+        Assert.Contains(_log.Lines, l => l.StartsWith("ERROR") && l.Contains("scanner crashed"));
+    }
+
+    [Fact]
+    public void Deferred_counts_no_attempt_and_rests_the_slot()
+    {
+        Files(3);
+        _settings.Workers = 1;
+        _c.Start();
+        Step();
+        _runner.Finish(0, ExportOutcome.Defer("share unreachable", TimeSpan.Zero));
+        var row = _store.Get(@"T:\p2.apj")!;
+        Assert.Equal(FileStatus.Pending, row.Status);
+        Assert.Equal(0, row.Attempts);
+
+        Step();
+        Assert.Single(_runner.Calls); // slot resting
+        Step(RunController.SlotCooldown);
+        Assert.Equal(2, _runner.Calls.Count);
+        Assert.Equal(@"T:\p1.apj", _runner.Calls[1].Path); // p2 waits out its retry time
+    }
+
+    [Fact]
+    public void First_scan_is_scheduled_from_the_last_completed_scan()
+    {
+        Files(1);
+        _c.Start();
+        Step();
+        Assert.Equal(1, _scanner.Runs);
+        // An incomplete scan recorded after it (e.g. cut short by exit) must not delay a relaunch's scan.
+        var cut = _store.BeginScan(_clock.UtcNow.AddMinutes(30));
+        _store.FinishScan(cut, _clock.UtcNow.AddMinutes(30), 0, 0, Array.Empty<string>(), completed: false);
+
+        _clock.Advance(TimeSpan.FromMinutes(61));
+        var relaunched = new RunController(_store, _runner, _scanner, _idle, _clock, _log, () => _settings);
+        relaunched.Start();
+        relaunched.Tick();
+        Assert.Equal(2, _scanner.Runs);
     }
 
     [Fact]

@@ -20,13 +20,23 @@ public interface IIdleSource
     long LastInputMarker { get; }
 }
 
-public enum ExportOutcomeKind { Success, Failed, Cancelled }
+public enum ExportOutcomeKind
+{
+    Success,
+    /// <summary>The export of this file failed: counts an attempt.</summary>
+    Failed,
+    /// <summary>Stopped by the app (exit): no attempt counted.</summary>
+    Cancelled,
+    /// <summary>Not the file's fault (share unreachable, AVAproject missing, worker desktop failed): no attempt counted, retried later.</summary>
+    Deferred,
+}
 
 public sealed record ExportOutcome(ExportOutcomeKind Kind, string? Error, TimeSpan Duration, string? ScreenshotPath = null)
 {
     public static ExportOutcome Ok(TimeSpan duration) => new(ExportOutcomeKind.Success, null, duration);
     public static ExportOutcome Fail(string error, TimeSpan duration, string? screenshot = null) => new(ExportOutcomeKind.Failed, error, duration, screenshot);
     public static ExportOutcome Cancel(TimeSpan duration) => new(ExportOutcomeKind.Cancelled, "cancelled", duration);
+    public static ExportOutcome Defer(string error, TimeSpan duration) => new(ExportOutcomeKind.Deferred, error, duration);
 }
 
 /// <summary>Runs one export on a given worker slot. Each slot runs at most one export at a time.</summary>

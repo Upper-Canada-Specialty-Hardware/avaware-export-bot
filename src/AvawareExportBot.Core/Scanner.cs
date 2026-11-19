@@ -41,7 +41,8 @@ public sealed class Scanner
         var scanId = _store.BeginScan(_utcNow());
         _log.Info($"Scan {scanId} started: {root}");
         var watch = Stopwatch.StartNew();
-        int dirs = 0, found = 0, needing = 0, unreadable = 0;
+        int dirs = 0, found = 0, needing = 0;
+        var unreadable = new List<string>();
         var batch = new List<ScannedApj>(BatchSize);
         var lastReport = Stopwatch.StartNew();
         var completed = false;
@@ -75,7 +76,9 @@ public sealed class Scanner
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or System.Security.SecurityException)
                 {
-                    unreadable++;
+                    // The root itself unreadable: nothing was seen, so the scan cannot count as complete.
+                    if (dirs == 1) throw new IOException($"cannot read the root {dir}: {ex.Message}", ex);
+                    unreadable.Add(dir);
                     _log.Warn($"Scan {scanId}: cannot read {dir}: {ex.Message}");
                     continue;
                 }
@@ -93,7 +96,11 @@ public sealed class Scanner
 
                 foreach (var sub in subdirs)
                 {
-                    if ((sub.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    if ((sub.Attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        _log.Info($"Scan {scanId}: not following folder link {sub.FullName}");
+                        continue;
+                    }
                     pending.Push(sub.FullName);
                 }
 
@@ -128,7 +135,7 @@ public sealed class Scanner
         _store.FinishScan(scanId, finished, found, needing, unreadable, completed);
         progress?.Report(new ScanProgress(dirs, found, needing));
         _log.Info($"Scan {scanId} {(completed ? "finished" : "ended early")} in {watch.Elapsed:hh\\:mm\\:ss}: " +
-                  $"{found} .apj, {needing} need a .mdb, {unreadable} unreadable folders.");
-        return new ScanResult(scanId, found, needing, unreadable, completed, finished);
+                  $"{found} .apj, {needing} need a .mdb, {unreadable.Count} unreadable folders.");
+        return new ScanResult(scanId, found, needing, unreadable.Count, completed, finished);
     }
 }

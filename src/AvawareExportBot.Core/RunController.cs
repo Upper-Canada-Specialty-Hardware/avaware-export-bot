@@ -44,9 +44,16 @@ public sealed class RunController
         var i = error.LastIndexOf(ScreenshotTag, StringComparison.Ordinal);
         if (i < 0) return null;
         var start = i + ScreenshotTag.Length;
-        var end = error.IndexOf(']', start);
+        // The tag is the error's last part, so its closing ']' is the error's last one; the path itself may hold ']'.
+        var end = error.LastIndexOf(']');
         return end > start ? error[start..end] : null;
     }
+
+    /// <summary>How long a deferred row (not the file's fault) waits before it is claimed again.</summary>
+    public static readonly TimeSpan DeferredRetry = TimeSpan.FromMinutes(5);
+
+    /// <summary>How long a worker slot takes no new export after a deferred outcome.</summary>
+    public static readonly TimeSpan SlotCooldown = TimeSpan.FromSeconds(60);
 
     private readonly StateStore _store;
     private readonly IExportRunner _runner;
@@ -57,6 +64,7 @@ public sealed class RunController
     private readonly Func<Settings> _settings;
     private readonly object _gate = new();
     private readonly List<Slot?> _slots = new();
+    private readonly Dictionary<int, DateTime> _cooldownUntil = new();
 
     private RunState _state = RunState.Armed;
     private DateTime _lastIdleCheck = DateTime.MinValue;
@@ -89,7 +97,8 @@ public sealed class RunController
         _log = log;
         _settings = settings;
         _lastInputMarker = idle.LastInputMarker;
-        _lastScanFinished = store.LastFinishedScan()?.FinishedUtc;
+        // Seeded from the last scan that saw the whole root: one cut short by exit must not delay the next.
+        _lastScanFinished = store.LastFinishedScan(completedOnly: true)?.FinishedUtc;
         _counts = store.GetCounts();
     }
 
@@ -203,10 +212,12 @@ public sealed class RunController
     {
         var workers = Math.Max(1, settings.Workers);
         while (_slots.Count < workers) _slots.Add(null);
+        var now = _clock.UtcNow;
         for (var i = 0; i < workers; i++)
         {
             if (_slots[i] is not null) continue;
-            var row = _store.ClaimNext();
+            if (_cooldownUntil.TryGetValue(i, out var until) && now < until) continue;
+            var row = _store.ClaimNext(now);
             if (row is null) return;
             StartExportLocked(i, row);
         }
@@ -252,9 +263,18 @@ public sealed class RunController
                     _store.RecordCancelled(slot.Path);
                     _log.Info($"Worker {index}: cancelled: {slot.Path}");
                     break;
+                case ExportOutcomeKind.Deferred:
+                    // Not the file's fault: no attempt counted, the file waits a few minutes, the slot rests a minute.
+                    _store.RecordDeferred(slot.Path, outcome.Error ?? "deferred", _clock.UtcNow + DeferredRetry);
+                    lock (_gate) _cooldownUntil[index] = _clock.UtcNow + SlotCooldown;
+                    _log.Warn($"Worker {index}: deferred (not counted as an attempt): {slot.Path}: {outcome.Error}");
+                    break;
                 default:
                     var shot = outcome.ScreenshotPath is null ? "" : $" {ScreenshotTag}{outcome.ScreenshotPath}]";
-                    var status = _store.RecordFailure(slot.Path, (outcome.Error ?? "unknown error") + shot, _clock.UtcNow, _settings().MaxAttempts);
+                    var settings = _settings();
+                    // Retried on a later pass, never back to back: a share blip or a locked file must not burn every attempt.
+                    var retryAfter = _clock.UtcNow + TimeSpan.FromMinutes(settings.RescanMinutes);
+                    var status = _store.RecordFailure(slot.Path, (outcome.Error ?? "unknown error") + shot, _clock.UtcNow, settings.MaxAttempts, retryAfter);
                     _log.Warn($"Worker {index}: failed after {Format(outcome.Duration)} ({(status == FileStatus.Failed ? "giving up" : "will retry")}): {slot.Path}: {outcome.Error}{shot}");
                     break;
             }

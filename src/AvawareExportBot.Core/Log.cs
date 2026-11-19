@@ -55,7 +55,7 @@ public sealed class FileLog : ILog
             {
                 File.AppendAllText(Path.Combine(_dir, now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".log"), line + Environment.NewLine);
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 // Logging must never take the bot down; the tail still has the line.
             }
@@ -72,9 +72,28 @@ public sealed class FileLog : ILog
         foreach (var file in Directory.EnumerateFiles(_dir, "*.log"))
         {
             if (DateTime.TryParseExact(Path.GetFileNameWithoutExtension(file), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) && day < cutoff)
-            {
-                try { File.Delete(file); } catch (IOException) { }
-            }
+                TryDelete(file);
         }
+    }
+
+    /// <summary>Deletes files in a folder last written more than <see cref="KeepDays"/> days ago (failure screenshots).</summary>
+    public static void PruneOlderThanKeepDays(string dir, DateTime now)
+    {
+        if (!Directory.Exists(dir)) return;
+        var cutoff = now.AddDays(-KeepDays);
+        foreach (var file in Directory.EnumerateFiles(dir))
+        {
+            try
+            {
+                if (File.GetLastWriteTime(file) < cutoff) TryDelete(file);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    private static void TryDelete(string file)
+    {
+        try { File.Delete(file); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 }

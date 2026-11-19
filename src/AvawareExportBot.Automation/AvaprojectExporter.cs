@@ -11,6 +11,12 @@ public sealed class ExportFailure : Exception
     public string? Screenshot { get; }
 }
 
+/// <summary>Raised when an export cannot run for a reason that is not the file's: no attempt is counted.</summary>
+public sealed class ExportDeferred : Exception
+{
+    public ExportDeferred(string message) : base(message) { }
+}
+
 /// <summary>
 /// Turns one .apj into a .mdb by driving AVAproject on a hidden desktop with posted window messages only
 /// (export approach ruling, #3; spec #8). Nothing is shown on the user's desktop, and the .apj on the share is never
@@ -29,12 +35,11 @@ public sealed class AvaprojectExporter
     private const string ProgressTitle = "Export Project to Microsoft Access";
     private const string MetricTitle = "Export Dimensional Values";
     private const string SaveProjectTitle = "Save Project";
+    private const string ExportDialogPrefix = "Export Project to ";
     private const int FileMenuX = 47, FileMenuY = 11;
     private const int SaveDialogFileNameId = 1001, SaveDialogSaveId = 1, SaveProjectNoId = 7, CancelId = 2;
-    private const string ExportDialogPrefix = "Export Project to ";
     private const int MenuAttempts = 3;
     private const int KeyDelay = 500;
-    private static readonly TimeSpan DialogWait = TimeSpan.FromSeconds(15);
 
     /// <summary>Visible window classes AVAproject (or Windows' text input in its process) shows in normal work.</summary>
     private static readonly HashSet<string> KnownClasses = new(StringComparer.Ordinal)
@@ -46,23 +51,37 @@ public sealed class AvaprojectExporter
 
     private static readonly TimeSpan LoadTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PopupWait = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DialogWait = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan QuitTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UnknownWindowGrace = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan SnapshotTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan Poll = TimeSpan.FromMilliseconds(250);
 
     private readonly HiddenDesktop _desktop;
+    private readonly IntPtr _userDesktop;
     private readonly string _exePath;
     private readonly string _workDir;
     private readonly string _snapsDir;
-    private readonly IntPtr _userDesktop;
 
-    public AvaprojectExporter(HiddenDesktop desktop, string avaprojectExe, string workDir, string snapsDir)
+    /// <param name="userDesktop">The user's desktop, opened for enumeration by the caller, for the leak guard.</param>
+    public AvaprojectExporter(HiddenDesktop desktop, IntPtr userDesktop, string avaprojectExe, string workDir, string snapsDir)
     {
+        if (userDesktop == IntPtr.Zero) throw new ArgumentException("The user's desktop handle is required for the leak guard.", nameof(userDesktop));
         _desktop = desktop;
+        _userDesktop = userDesktop;
         _exePath = avaprojectExe;
         _workDir = workDir;
         _snapsDir = snapsDir;
-        _userDesktop = Native.OpenDesktop("Default", 0, false, 0x0040 /* DESKTOP_ENUMERATE */ | 0x0001 /* DESKTOP_READOBJECTS */);
+    }
+
+    /// <summary>Opens the user's desktop for the leak guard; zero when it cannot be opened.</summary>
+    public static IntPtr OpenUserDesktop() =>
+        Native.OpenDesktop("Default", 0, false, 0x0040 /* DESKTOP_ENUMERATE */ | 0x0001 /* DESKTOP_READOBJECTS */);
+
+    public static void CloseUserDesktop(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero) Native.CloseDesktop(handle);
     }
 
     /// <summary>Time allowed for the export itself, after Save: 10 min plus 2 min per MB of .apj.</summary>
@@ -81,6 +100,10 @@ public sealed class AvaprojectExporter
         catch (OperationCanceledException)
         {
             return ExportOutcome.Cancel(watch.Elapsed);
+        }
+        catch (ExportDeferred d)
+        {
+            return ExportOutcome.Defer($"{run.Step}: {d.Message}", watch.Elapsed);
         }
         catch (ExportFailure f)
         {
@@ -133,10 +156,17 @@ public sealed class AvaprojectExporter
         public void Execute()
         {
             Enter("copy");
+            if (!File.Exists(_x._exePath)) throw new ExportDeferred($"AVAproject not found at {_x._exePath}");
             if (File.Exists(_target)) return; // made by someone else since the scan: nothing to do
+            if (!File.Exists(_apj))
+            {
+                if (!Directory.Exists(Path.GetDirectoryName(_apj))) throw new ExportDeferred("the .apj's folder or share is not reachable");
+                throw new ExportFailure("copy: source .apj missing");
+            }
             ResetWorkDir();
-            if (!File.Exists(_apj)) throw new ExportFailure("copy: source .apj missing");
             File.Copy(_apj, _localApj, overwrite: true);
+            // A read-only source copies read-only; left that way it could never be deleted or overwritten.
+            File.SetAttributes(_localApj, FileAttributes.Normal);
             var apjBytes = new FileInfo(_localApj).Length;
 
             Enter("launch");
@@ -159,7 +189,7 @@ public sealed class AvaprojectExporter
             var edit = Windows.ChildById(dlg, SaveDialogFileNameId, "Edit");
             var save = Windows.ChildById(dlg, SaveDialogSaveId, "Button");
             if (edit == IntPtr.Zero || save == IntPtr.Zero) throw new ExportFailure("save dialog: file name box or Save button not found");
-            Native.SendMessage(edit, Native.WM_SETTEXT, IntPtr.Zero, _localMdb);
+            if (!Windows.SetText(edit, _localMdb)) throw new ExportFailure("save dialog: AVAproject did not respond (setting the file name)");
             var typed = Windows.Text(edit);
             if (!string.Equals(typed, _localMdb, StringComparison.Ordinal))
                 throw new ExportFailure($"save dialog: file name reads back as '{typed}'");
@@ -178,57 +208,78 @@ public sealed class AvaprojectExporter
 
         /// <summary>
         /// File → Export Project → Microsoft Access (.mdb), retried up to <see cref="MenuAttempts"/> times. Posted keys
-        /// can be dropped while a popup is still opening; a dropped Down picks "Ascii Text" instead. A wrong export
-        /// dialog is cancelled and the menu retried; menus left open are closed with Escape before a retry.
+        /// can be dropped while a popup is still opening (a dropped Down picks "Ascii Text"); any step that does not
+        /// happen — a popup not showing, a wrong export dialog, no dialog — closes the menus and retries the whole menu.
+        /// An Access dialog that opens late is picked up while cleaning up.
         /// </summary>
         private IntPtr OpenAccessExportDialog(IntPtr dock)
         {
             for (var attempt = 1; ; attempt++)
             {
-                var file = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(), onWait: n =>
-                {
-                    if (n % 20 == 0) Windows.PostClick(dock, FileMenuX, FileMenuY); // first try, then every 5 s
-                });
-                Thread.Sleep(KeyDelay);
-                Windows.PostKey(file, Native.VK_E);
-                var export = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(h => h != file));
-                Thread.Sleep(KeyDelay);
-                Windows.PostKey(export, Native.VK_DOWN);
-                Thread.Sleep(KeyDelay);
-                Windows.PostKey(export, Native.VK_RETURN);
+                var found = TryMenuOnce(dock);
+                if (found != IntPtr.Zero && IsSaveDialog(Windows.Describe(found))) return found;
 
-                var outcome = WaitFor(DialogWait, wins =>
+                // Clean up: cancel a wrong export dialog, close menus, and wait until the main window is alone,
+                // taking the Access dialog if it turns up meanwhile.
+                if (found != IntPtr.Zero)
                 {
-                    var d = wins.FirstOrDefault(w => w.Class == DialogClass && w.Title.StartsWith(ExportDialogPrefix, StringComparison.Ordinal));
-                    return d.Handle;
-                }, extraKnown: IsAnyExportDialog, timeoutReturnsZero: true);
-
-                if (outcome != IntPtr.Zero && Windows.Text(outcome) == SaveDialogTitle) return outcome;
-                if (attempt >= MenuAttempts)
-                    throw new ExportFailure(outcome == IntPtr.Zero
-                        ? $"menu: export dialog did not open after {MenuAttempts} tries"
-                        : $"menu: wrong export dialog '{Windows.Text(outcome)}' after {MenuAttempts} tries");
-
-                if (outcome != IntPtr.Zero)
-                {
-                    var cancel = Windows.ChildById(outcome, CancelId, "Button");
-                    if (cancel != IntPtr.Zero) Native.PostMessage(cancel, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-                    else Native.PostMessage(outcome, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    var cancel = Windows.ChildById(found, CancelId, "Button");
+                    Native.PostMessage(cancel != IntPtr.Zero ? cancel : found, cancel != IntPtr.Zero ? Native.BM_CLICK : Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                 }
-                // Close any menus still open, then wait for the main window to be alone again.
-                foreach (var popup in Windows.TopLevel(_x._desktop.Handle, _proc!.Id).Where(w => w.Class == PopupClass))
-                    Windows.PostKey(popup.Handle, Native.VK_ESCAPE);
-                WaitFor(StepTimeout, wins => wins.Any(w => w.Class == PopupClass || IsAnyExportDialog(w)) ? IntPtr.Zero : (IntPtr)1,
-                    extraKnown: IsAnyExportDialog);
+                IntPtr late = IntPtr.Zero;
+                WaitFor(StepTimeout, wins =>
+                {
+                    var access = wins.FirstOrDefault(IsSaveDialog);
+                    if (access.Handle != IntPtr.Zero) { late = access.Handle; return late; }
+                    var popups = wins.Where(w => w.Class == PopupClass).ToList();
+                    foreach (var p in popups) Windows.PostKey(p.Handle, Native.VK_ESCAPE);
+                    return popups.Count == 0 && !wins.Any(IsAnyExportDialog) ? (IntPtr)1 : IntPtr.Zero;
+                }, extraKnown: IsAnyExportDialog);
+                if (late != IntPtr.Zero) return late;
+
+                if (attempt >= MenuAttempts)
+                    throw new ExportFailure(found == IntPtr.Zero
+                        ? $"menu: export dialog did not open after {MenuAttempts} tries"
+                        : $"menu: wrong export dialog '{Windows.Text(found)}' after {MenuAttempts} tries");
             }
         }
 
-        private static bool IsAnyExportDialog(Win w) => w.Class == DialogClass && w.Title.StartsWith(ExportDialogPrefix, StringComparison.Ordinal);
+        /// <summary>One pass through the menu. Returns the export dialog that opened, or zero when a step did not happen.</summary>
+        private IntPtr TryMenuOnce(IntPtr dock)
+        {
+            var file = WaitFor(PopupWait, wins => Popups(wins).FirstOrDefault(), onWait: n =>
+            {
+                if (n == 0) Windows.PostClick(dock, FileMenuX, FileMenuY);
+            }, timeoutReturnsZero: true);
+            if (file == IntPtr.Zero) return IntPtr.Zero;
+            Thread.Sleep(KeyDelay);
+            Windows.PostKey(file, Native.VK_E);
+            var export = WaitFor(PopupWait, wins => Popups(wins).FirstOrDefault(h => h != file), timeoutReturnsZero: true);
+            if (export == IntPtr.Zero) return IntPtr.Zero;
+            Thread.Sleep(KeyDelay);
+            Windows.PostKey(export, Native.VK_DOWN);
+            Thread.Sleep(KeyDelay);
+            Windows.PostKey(export, Native.VK_RETURN);
+            return WaitFor(DialogWait, wins => wins.FirstOrDefault(IsAnyExportDialog).Handle, extraKnown: IsAnyExportDialog, timeoutReturnsZero: true);
+        }
 
-        /// <summary>After Save: answer the metric dialog once if it appears, then wait until the .mdb is complete.</summary>
+        /// <summary>The Access save dialog: the #32770 with that caption that has the file name box.</summary>
+        private static bool IsSaveDialog(Win w) =>
+            w.Class == DialogClass && w.Title == SaveDialogTitle && Windows.ChildById(w.Handle, SaveDialogFileNameId, "Edit") != IntPtr.Zero;
+
+        private static bool IsAnyExportDialog(Win w) =>
+            w.Class == DialogClass && w.Title.StartsWith(ExportDialogPrefix, StringComparison.Ordinal) &&
+            Windows.ChildById(w.Handle, SaveDialogFileNameId, "Edit") != IntPtr.Zero;
+
+        /// <summary>
+        /// After Save: answer the metric dialog once if it appears, then wait until the .mdb is complete. Done needs the
+        /// export to have been seen running (its .ldb or the progress form, at least once) and then three quiet polls:
+        /// absence alone could be the moment before the export starts.
+        /// </summary>
         private void WaitForExport(long apjBytes)
         {
             var metricAnswered = false;
+            var sawRunning = false;
             var stable = 0;
             long lastSize = -1;
             var ldb = Path.ChangeExtension(_localMdb, ".ldb");
@@ -237,21 +288,26 @@ public sealed class AvaprojectExporter
                 var metric = wins.FirstOrDefault(w => w.Class == FormClass && w.Title == MetricTitle);
                 if (metric.Handle != IntPtr.Zero)
                 {
-                    if (metricAnswered) return IntPtr.Zero; // still closing
-                    ChooseMetric(metric.Handle);
-                    metricAnswered = true;
+                    if (!metricAnswered)
+                    {
+                        ChooseMetric(metric.Handle);
+                        metricAnswered = true;
+                    }
                     return IntPtr.Zero;
                 }
-                var busy = wins.Any(w => (w.Class == FormClass && w.Title == ProgressTitle) || (w.Class == DialogClass && w.Title == SaveDialogTitle));
+                var progress = wins.Any(w => w.Class == FormClass && w.Title == ProgressTitle);
+                var saveDialog = wins.Any(IsSaveDialog);
+                var locked = File.Exists(ldb);
+                if (progress || locked) sawRunning = true;
                 var size = File.Exists(_localMdb) ? new FileInfo(_localMdb).Length : 0;
-                if (busy || size == 0 || File.Exists(ldb) || size != lastSize)
+                if (!sawRunning || progress || saveDialog || locked || size == 0 || size != lastSize)
                 {
                     stable = 0;
                     lastSize = size;
                     return IntPtr.Zero;
                 }
-                return ++stable >= 3 ? (IntPtr)1 : IntPtr.Zero; // three quiet polls in a row
-            }, extraKnown: w => (w.Class == FormClass && (w.Title == ProgressTitle || w.Title == MetricTitle)) || (w.Class == DialogClass && w.Title == SaveDialogTitle));
+                return ++stable >= 3 ? (IntPtr)1 : IntPtr.Zero;
+            }, extraKnown: w => (w.Class == FormClass && (w.Title == ProgressTitle || w.Title == MetricTitle)) || IsSaveDialog(w));
         }
 
         private static void ChooseMetric(IntPtr dialog)
@@ -260,9 +316,10 @@ public sealed class AvaprojectExporter
             var metric = kids.FirstOrDefault(k => k.Visible && k.Class == "ThunderRT6OptionButton" && k.Title.StartsWith("Metric", StringComparison.Ordinal)).Handle;
             var ok = kids.FirstOrDefault(k => k.Visible && k.Class == "ThunderRT6CommandButton" && k.Title == "OK").Handle;
             if (metric == IntPtr.Zero || ok == IntPtr.Zero) throw new ExportFailure("export: metric dialog controls not found");
-            Native.SendMessage(metric, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-            var check = (int)Native.SendMessage(metric, Native.BM_GETCHECK, IntPtr.Zero, IntPtr.Zero);
-            if (check != 1) throw new ExportFailure("export: Metric (Millimeters) did not become selected");
+            if (!Windows.Send(metric, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero, out _) ||
+                !Windows.Send(metric, Native.BM_GETCHECK, IntPtr.Zero, IntPtr.Zero, out var check))
+                throw new ExportFailure("export: AVAproject did not respond to the metric dialog");
+            if ((int)check != 1) throw new ExportFailure("export: Metric (Millimeters) did not become selected");
             Native.PostMessage(ok, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero);
         }
 
@@ -275,6 +332,7 @@ public sealed class AvaprojectExporter
             {
                 _ct.ThrowIfCancellationRequested();
                 if (_proc!.HasExited) return;
+                GuardAgainstLeak();
                 var prompt = Windows.TopLevel(_x._desktop.Handle, _proc.Id).FirstOrDefault(w => w.Class == DialogClass && w.Title == SaveProjectTitle);
                 if (prompt.Handle != IntPtr.Zero)
                 {
@@ -290,14 +348,19 @@ public sealed class AvaprojectExporter
         private void Move()
         {
             if (File.Exists(_target)) return; // someone else's .mdb appeared meanwhile: keep theirs
-            File.Copy(_localMdb, _partial, overwrite: true);
+            var folder = Path.GetDirectoryName(_target)!;
             try
             {
+                File.Copy(_localMdb, _partial, overwrite: true);
                 File.Move(_partial, _target, overwrite: false);
             }
             catch (IOException) when (File.Exists(_target))
             {
                 // Lost the race to another export of the same file: keep the existing one.
+            }
+            catch (IOException) when (!Directory.Exists(folder))
+            {
+                throw new ExportDeferred("the .apj's folder or share is not reachable");
             }
             finally
             {
@@ -305,10 +368,16 @@ public sealed class AvaprojectExporter
             }
         }
 
+        private void GuardAgainstLeak()
+        {
+            if (Windows.HasVisibleWindow(_x._userDesktop, _proc!.Id))
+                throw new ExportFailure($"{Step}: AVAproject window leaked to the user desktop");
+        }
+
         /// <summary>
         /// Polls the process's windows on the hidden desktop until <paramref name="check"/> returns a handle.
-        /// Fails on timeout, on the process exiting, on a window leaking to the user's desktop, or on an unknown window
-        /// that stays up for <see cref="UnknownWindowGrace"/> (snapshot saved).
+        /// Fails on timeout (or returns zero with <paramref name="timeoutReturnsZero"/>), on the process exiting, on a
+        /// window leaking to the user's desktop, or on an unknown window that stays up for <see cref="UnknownWindowGrace"/>.
         /// </summary>
         private IntPtr WaitFor(TimeSpan timeout, Func<List<Win>, IntPtr> check, Action<int>? onWait = null, Func<Win, bool>? extraKnown = null,
             bool timeoutReturnsZero = false)
@@ -319,8 +388,7 @@ public sealed class AvaprojectExporter
                 _ct.ThrowIfCancellationRequested();
                 if (_proc!.HasExited)
                     throw new ExportFailure($"{Step}: AVAproject exited ({ExitCodeText(_proc)})");
-                if (_x._userDesktop != IntPtr.Zero && Windows.HasVisibleWindow(_x._userDesktop, _proc.Id))
-                    throw new ExportFailure($"{Step}: AVAproject window leaked to the user desktop");
+                GuardAgainstLeak();
 
                 var wins = Windows.TopLevel(_x._desktop.Handle, _proc.Id).Where(w => w.Width >= 20).ToList();
                 CheckUnknown(wins, extraKnown);
@@ -353,7 +421,8 @@ public sealed class AvaprojectExporter
         {
             if (KnownClasses.Contains(w.Class)) return true;
             if (w.Class == FormClass) return w.Title.Length == 0; // the splash; titled forms are matched per step
-            if (w.Class == DialogClass) return w.Title == SaveDialogTitle || w.Title == SaveProjectTitle;
+            // A same-captioned message box (overwrite prompt, path error) is not the save dialog: unexpected.
+            if (w.Class == DialogClass) return IsSaveDialog(w) || w.Title == SaveProjectTitle;
             return false;
         }
 
@@ -362,7 +431,7 @@ public sealed class AvaprojectExporter
             if (h == IntPtr.Zero) return null;
             var name = $"{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}-{why}-{SafeName(Path.GetFileNameWithoutExtension(_apj))}.png";
             var path = Path.Combine(_x._snapsDir, name);
-            return Windows.Snapshot(h, path) ? path : null;
+            return Windows.SnapshotWithTimeout(_x._desktop.Handle, h, path, SnapshotTimeout) ? path : null;
         }
 
         private static string SafeName(string s)
@@ -405,9 +474,15 @@ public sealed class AvaprojectExporter
             try { ResetWorkDir(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
 
+        /// <summary>Deletes a file, clearing read-only first. Never throws.</summary>
         private static void TryDelete(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); }
+            try
+            {
+                if (!File.Exists(path)) return;
+                File.SetAttributes(path, FileAttributes.Normal);
+                File.Delete(path);
+            }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }

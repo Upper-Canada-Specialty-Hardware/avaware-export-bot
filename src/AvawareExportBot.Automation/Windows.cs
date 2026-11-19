@@ -83,6 +83,17 @@ internal static class Windows
         return found;
     }
 
+    /// <summary>Cross-process sends never block a worker: 5 s, and abort at once if AVAproject is hung.</summary>
+    public const uint SendTimeoutMs = 5000;
+
+    /// <summary>Sends a message with the send timeout. False when AVAproject did not answer in time.</summary>
+    public static bool Send(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam, out IntPtr result) =>
+        Native.SendMessageTimeoutPtr(h, msg, wParam, lParam, Native.SMTO_ABORTIFHUNG, SendTimeoutMs, out result) != IntPtr.Zero;
+
+    /// <summary>WM_SETTEXT with the send timeout. False when AVAproject did not answer in time.</summary>
+    public static bool SetText(IntPtr h, string text) =>
+        Native.SendMessageTimeoutText(h, Native.WM_SETTEXT, IntPtr.Zero, text, Native.SMTO_ABORTIFHUNG, SendTimeoutMs, out _) != IntPtr.Zero;
+
     public static void PostClick(IntPtr h, int x, int y)
     {
         var lp = Native.MakeLParam(x, y);
@@ -95,6 +106,22 @@ internal static class Windows
     {
         Native.PostMessage(h, Native.WM_KEYDOWN, (IntPtr)vk, (IntPtr)1);
         Native.PostMessage(h, Native.WM_KEYUP, (IntPtr)vk, unchecked((IntPtr)(int)0xC0000001));
+    }
+
+    /// <summary>
+    /// <see cref="Snapshot"/> on its own thread, attached to the window's desktop, given at most
+    /// <paramref name="timeout"/>: PrintWindow waits on the target window, and a hung AVAproject must not hang the worker.
+    /// A snapshot still stuck after the timeout is abandoned on its background thread.
+    /// </summary>
+    public static bool SnapshotWithTimeout(IntPtr desktop, IntPtr h, string path, TimeSpan timeout)
+    {
+        var ok = false;
+        var thread = new Thread(() =>
+        {
+            if (Native.SetThreadDesktop(desktop)) ok = Snapshot(h, path);
+        }) { IsBackground = true, Name = "snapshot" };
+        thread.Start();
+        return thread.Join(timeout) && ok;
     }
 
     /// <summary>Renders a window to a PNG with PrintWindow (works on hidden desktops). Returns false on failure.</summary>

@@ -13,7 +13,8 @@ public sealed record FileRow(
     int Attempts,
     string? LastError,
     DateTime? LastAttemptUtc,
-    DateTime? DoneUtc);
+    DateTime? DoneUtc,
+    DateTime? RetryAfterUtc = null);
 
 /// <summary>One .apj seen by a scan.</summary>
 public sealed record ScannedApj(string Path, long SizeBytes, DateTime ModifiedUtc, bool HasMdb);
@@ -32,7 +33,7 @@ public sealed record StatusCounts(int Pending, int Exporting, int Done, int Fail
 /// </summary>
 public sealed class StateStore : IDisposable
 {
-    public const int SchemaVersion = 1;
+    public const int SchemaVersion = 2;
 
     private readonly SqliteConnection _db;
     private readonly object _gate = new();
@@ -54,31 +55,41 @@ public sealed class StateStore : IDisposable
     private void Migrate()
     {
         var version = Convert.ToInt32(Scalar("PRAGMA user_version;"), CultureInfo.InvariantCulture);
-        if (version >= SchemaVersion) return;
-        Exec("""
-            CREATE TABLE IF NOT EXISTS files (
-                path             TEXT    NOT NULL PRIMARY KEY COLLATE NOCASE,
-                size_bytes       INTEGER NOT NULL,
-                apj_modified_utc TEXT    NOT NULL,
-                status           TEXT    NOT NULL CHECK (status IN ('pending', 'exporting', 'done', 'failed')),
-                attempts         INTEGER NOT NULL DEFAULT 0,
-                last_error       TEXT    NULL,
-                last_attempt_utc TEXT    NULL,
-                done_utc         TEXT    NULL,
-                seen_scan_id     INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_files_status_modified ON files (status, apj_modified_utc DESC);
-            CREATE TABLE IF NOT EXISTS scans (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                started_utc     TEXT    NOT NULL,
-                finished_utc    TEXT    NULL,
-                apj_found       INTEGER NOT NULL DEFAULT 0,
-                needing_export  INTEGER NOT NULL DEFAULT 0,
-                unreadable_dirs INTEGER NOT NULL DEFAULT 0,
-                completed       INTEGER NOT NULL DEFAULT 0
-            );
-            PRAGMA user_version = 1;
-            """);
+        if (version < 1)
+        {
+            Exec("""
+                CREATE TABLE IF NOT EXISTS files (
+                    path             TEXT    NOT NULL PRIMARY KEY COLLATE NOCASE,
+                    size_bytes       INTEGER NOT NULL,
+                    apj_modified_utc TEXT    NOT NULL,
+                    status           TEXT    NOT NULL CHECK (status IN ('pending', 'exporting', 'done', 'failed')),
+                    attempts         INTEGER NOT NULL DEFAULT 0,
+                    last_error       TEXT    NULL,
+                    last_attempt_utc TEXT    NULL,
+                    done_utc         TEXT    NULL,
+                    seen_scan_id     INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_files_status_modified ON files (status, apj_modified_utc DESC);
+                CREATE TABLE IF NOT EXISTS scans (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_utc     TEXT    NOT NULL,
+                    finished_utc    TEXT    NULL,
+                    apj_found       INTEGER NOT NULL DEFAULT 0,
+                    needing_export  INTEGER NOT NULL DEFAULT 0,
+                    unreadable_dirs INTEGER NOT NULL DEFAULT 0,
+                    completed       INTEGER NOT NULL DEFAULT 0
+                );
+                PRAGMA user_version = 1;
+                """);
+        }
+        if (version < 2)
+        {
+            // Retry backoff: a failed or deferred row is not claimed again before this time.
+            Exec("""
+                ALTER TABLE files ADD COLUMN retry_after_utc TEXT NULL;
+                PRAGMA user_version = 2;
+                """);
+        }
     }
 
     // ---- scans ----
@@ -117,6 +128,7 @@ public sealed class StateStore : IDisposable
                         WHEN files.status = 'done' THEN 'pending'
                         ELSE files.status END,
                     attempts = CASE WHEN NOT $hasMdb AND files.status = 'done' THEN 0 ELSE files.attempts END,
+                    retry_after_utc = CASE WHEN $hasMdb OR files.status = 'done' THEN NULL ELSE files.retry_after_utc END,
                     done_utc = CASE
                         WHEN $hasMdb THEN COALESCE(files.done_utc, $now)
                         ELSE NULL END;
@@ -140,10 +152,11 @@ public sealed class StateStore : IDisposable
     }
 
     /// <summary>
-    /// Closes a scan. Only a completed scan deletes the rows it did not see (their .apj is gone); a failed or cancelled
-    /// scan keeps every row. Rows being exported are never deleted here.
+    /// Closes a scan. Only a completed scan deletes the rows it did not see (their .apj is gone), and never rows under a
+    /// directory it could not list (<paramref name="unreadableDirs"/>): those were not seen, not proven gone. A failed or
+    /// cancelled scan keeps every row. Rows being exported are never deleted here.
     /// </summary>
-    public void FinishScan(long scanId, DateTime utcNow, int apjFound, int needingExport, int unreadableDirs, bool completed)
+    public void FinishScan(long scanId, DateTime utcNow, int apjFound, int needingExport, IReadOnlyCollection<string> unreadableDirs, bool completed)
     {
         lock (_gate)
         {
@@ -156,28 +169,42 @@ public sealed class StateStore : IDisposable
                 cmd.Parameters.AddWithValue("$t", Iso(utcNow));
                 cmd.Parameters.AddWithValue("$f", apjFound);
                 cmd.Parameters.AddWithValue("$n", needingExport);
-                cmd.Parameters.AddWithValue("$u", unreadableDirs);
+                cmd.Parameters.AddWithValue("$u", unreadableDirs.Count);
                 cmd.Parameters.AddWithValue("$c", completed ? 1 : 0);
                 cmd.Parameters.AddWithValue("$id", scanId);
                 cmd.ExecuteNonQuery();
             }
             if (completed)
             {
-                using var del = Cmd("DELETE FROM files WHERE seen_scan_id < $id AND status <> 'exporting';", tx);
-                del.Parameters.AddWithValue("$id", scanId);
-                del.ExecuteNonQuery();
+                var stale = new List<string>();
+                using (var find = Cmd("SELECT path FROM files WHERE seen_scan_id < $id AND status <> 'exporting';", tx))
+                {
+                    find.Parameters.AddWithValue("$id", scanId);
+                    using var r = find.ExecuteReader();
+                    while (r.Read()) stale.Add(r.GetString(0));
+                }
+                var prefixes = unreadableDirs.Select(d => d.TrimEnd('\\', '/') + System.IO.Path.DirectorySeparatorChar).ToList();
+                using var del = Cmd("DELETE FROM files WHERE path = $p;", tx);
+                var p = del.Parameters.Add("$p", SqliteType.Text);
+                foreach (var path in stale)
+                {
+                    if (prefixes.Any(pre => path.StartsWith(pre, StringComparison.OrdinalIgnoreCase))) continue;
+                    p.Value = path;
+                    del.ExecuteNonQuery();
+                }
             }
             tx.Commit();
         }
     }
 
-    public ScanInfo? LastFinishedScan()
+    /// <summary>The last scan that finished; with <paramref name="completedOnly"/>, the last one that saw the whole root.</summary>
+    public ScanInfo? LastFinishedScan(bool completedOnly = false)
     {
         lock (_gate)
         {
-            using var cmd = Cmd("""
+            using var cmd = Cmd($"""
                 SELECT id, started_utc, finished_utc, apj_found, needing_export, unreadable_dirs, completed
-                FROM scans WHERE finished_utc IS NOT NULL ORDER BY id DESC LIMIT 1;
+                FROM scans WHERE finished_utc IS NOT NULL {(completedOnly ? "AND completed = 1" : "")} ORDER BY id DESC LIMIT 1;
                 """);
             using var r = cmd.ExecuteReader();
             if (!r.Read()) return null;
@@ -187,16 +214,25 @@ public sealed class StateStore : IDisposable
 
     // ---- exports ----
 
-    /// <summary>Claims the newest pending .apj for export, or returns null when nothing is pending.</summary>
-    public FileRow? ClaimNext()
+    /// <summary>
+    /// Claims the newest pending .apj that is due (no retry_after, or it has passed) for export; null when none is due.
+    /// </summary>
+    public FileRow? ClaimNext(DateTime utcNow)
     {
         lock (_gate)
         {
             while (true)
             {
                 string? path;
-                using (var pick = Cmd("SELECT path FROM files WHERE status = 'pending' ORDER BY apj_modified_utc DESC LIMIT 1;"))
+                using (var pick = Cmd("""
+                    SELECT path FROM files
+                    WHERE status = 'pending' AND (retry_after_utc IS NULL OR retry_after_utc <= $now)
+                    ORDER BY apj_modified_utc DESC LIMIT 1;
+                    """))
+                {
+                    pick.Parameters.AddWithValue("$now", Iso(utcNow));
                     path = pick.ExecuteScalar() as string;
+                }
                 if (path is null) return null;
                 if (TryClaimLocked(path)) return GetLocked(path);
             }
@@ -221,7 +257,8 @@ public sealed class StateStore : IDisposable
         lock (_gate)
         {
             using var cmd = Cmd("""
-                UPDATE files SET status = 'done', done_utc = $t, last_attempt_utc = $t, last_error = NULL WHERE path = $p;
+                UPDATE files SET status = 'done', done_utc = $t, last_attempt_utc = $t, last_error = NULL, retry_after_utc = NULL
+                WHERE path = $p;
                 """);
             cmd.Parameters.AddWithValue("$t", Iso(utcNow));
             cmd.Parameters.AddWithValue("$p", path);
@@ -229,8 +266,11 @@ public sealed class StateStore : IDisposable
         }
     }
 
-    /// <summary>Counts a failed attempt. Returns the new status: 'pending' to retry later, or 'failed' at the max.</summary>
-    public FileStatus RecordFailure(string path, string error, DateTime utcNow, int maxAttempts)
+    /// <summary>
+    /// Counts a failed attempt. Returns the new status: 'pending' to retry no sooner than <paramref name="retryAfterUtc"/>,
+    /// or 'failed' at the max. A row no longer 'exporting' (a scan saw its .mdb) is left as it is.
+    /// </summary>
+    public FileStatus RecordFailure(string path, string error, DateTime utcNow, int maxAttempts, DateTime retryAfterUtc)
     {
         lock (_gate)
         {
@@ -239,17 +279,38 @@ public sealed class StateStore : IDisposable
                     attempts = attempts + 1,
                     last_error = $e,
                     last_attempt_utc = $t,
+                    retry_after_utc = $ra,
                     status = CASE WHEN attempts + 1 >= $max THEN 'failed' ELSE 'pending' END
                 WHERE path = $p AND status = 'exporting'
                 RETURNING status;
                 """);
             cmd.Parameters.AddWithValue("$e", error);
             cmd.Parameters.AddWithValue("$t", Iso(utcNow));
+            cmd.Parameters.AddWithValue("$ra", Iso(retryAfterUtc));
             cmd.Parameters.AddWithValue("$max", maxAttempts);
             cmd.Parameters.AddWithValue("$p", path);
             if (cmd.ExecuteScalar() is string s) return ParseStatus(s);
             // A scan already saw its .mdb (made 'done') or the .apj vanished: leave the row as it is.
             return GetLocked(path)?.Status ?? FileStatus.Done;
+        }
+    }
+
+    /// <summary>
+    /// Not the file's fault (share unreachable, AVAproject missing, worker desktop failed): back to 'pending' with no
+    /// attempt counted, not claimed again before <paramref name="retryAfterUtc"/>.
+    /// </summary>
+    public void RecordDeferred(string path, string error, DateTime retryAfterUtc)
+    {
+        lock (_gate)
+        {
+            using var cmd = Cmd("""
+                UPDATE files SET status = 'pending', last_error = $e, retry_after_utc = $ra
+                WHERE path = $p AND status = 'exporting';
+                """);
+            cmd.Parameters.AddWithValue("$e", error);
+            cmd.Parameters.AddWithValue("$ra", Iso(retryAfterUtc));
+            cmd.Parameters.AddWithValue("$p", path);
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -264,14 +325,34 @@ public sealed class StateStore : IDisposable
         }
     }
 
-    /// <summary>The user's retry of a failed .apj: back to 'pending' with no attempts.</summary>
+    /// <summary>The user's retry of a failed .apj: back to 'pending' with no attempts, due at once.</summary>
     public bool Retry(string path)
     {
         lock (_gate)
         {
-            using var cmd = Cmd("UPDATE files SET status = 'pending', attempts = 0 WHERE path = $p AND status = 'failed';");
+            using var cmd = Cmd("UPDATE files SET status = 'pending', attempts = 0, retry_after_utc = NULL WHERE path = $p AND status = 'failed';");
             cmd.Parameters.AddWithValue("$p", path);
             return cmd.ExecuteNonQuery() == 1;
+        }
+    }
+
+    /// <summary>The user's retry of several failed .apj in one statement.</summary>
+    public int Retry(IReadOnlyCollection<string> paths)
+    {
+        if (paths.Count == 0) return 0;
+        lock (_gate)
+        {
+            using var tx = _db.BeginTransaction();
+            using var cmd = Cmd("UPDATE files SET status = 'pending', attempts = 0, retry_after_utc = NULL WHERE path = $p AND status = 'failed';", tx);
+            var p = cmd.Parameters.Add("$p", SqliteType.Text);
+            var n = 0;
+            foreach (var path in paths)
+            {
+                p.Value = path;
+                n += cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+            return n;
         }
     }
 
@@ -279,7 +360,7 @@ public sealed class StateStore : IDisposable
     {
         lock (_gate)
         {
-            using var cmd = Cmd("UPDATE files SET status = 'pending', attempts = 0 WHERE status = 'failed';");
+            using var cmd = Cmd("UPDATE files SET status = 'pending', attempts = 0, retry_after_utc = NULL WHERE status = 'failed';");
             return cmd.ExecuteNonQuery();
         }
     }
@@ -355,7 +436,7 @@ public sealed class StateStore : IDisposable
 
     // ---- helpers ----
 
-    private const string Columns = "path, size_bytes, apj_modified_utc, status, attempts, last_error, last_attempt_utc, done_utc";
+    private const string Columns = "path, size_bytes, apj_modified_utc, status, attempts, last_error, last_attempt_utc, done_utc, retry_after_utc";
 
     private static FileRow ReadRow(SqliteDataReader r) => new(
         r.GetString(0),
@@ -365,7 +446,8 @@ public sealed class StateStore : IDisposable
         r.GetInt32(4),
         r.IsDBNull(5) ? null : r.GetString(5),
         r.IsDBNull(6) ? null : ParseIso(r.GetString(6)),
-        r.IsDBNull(7) ? null : ParseIso(r.GetString(7)));
+        r.IsDBNull(7) ? null : ParseIso(r.GetString(7)),
+        r.IsDBNull(8) ? null : ParseIso(r.GetString(8)));
 
     private SqliteCommand Cmd(string sql, SqliteTransaction? tx = null)
     {

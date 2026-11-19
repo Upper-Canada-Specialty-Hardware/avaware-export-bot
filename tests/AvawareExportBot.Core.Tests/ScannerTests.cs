@@ -140,6 +140,31 @@ public sealed class ScannerTests : IDisposable
     }
 
     [Fact]
+    public void Unreadable_root_is_an_incomplete_scan_that_deletes_nothing()
+    {
+        if (OperatingSystem.IsWindows()) return; // POSIX permission bits; runs in CI on Linux.
+        _dir.File("root/a.apj");
+        var (store, scanner) = Make();
+        using (store)
+        {
+            scanner.Run(Root, null, CancellationToken.None);
+            File.SetUnixFileMode(Root, UnixFileMode.None);
+            try
+            {
+                try { if (Directory.EnumerateFileSystemEntries(Root).Any()) return; } // running as root
+                catch (UnauthorizedAccessException) { }
+                var result = scanner.Run(Root, null, CancellationToken.None);
+                Assert.False(result.Completed);
+                Assert.Equal(1, store.GetCounts().Total);
+            }
+            finally
+            {
+                File.SetUnixFileMode(Root, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+        }
+    }
+
+    [Fact]
     public void Pending_rows_come_out_newest_first()
     {
         _dir.File("root/old.apj", new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));

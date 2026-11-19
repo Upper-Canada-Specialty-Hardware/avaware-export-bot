@@ -19,6 +19,7 @@ public sealed class AppHost : IDisposable
         Paths = paths;
         paths.EnsureCreated();
         Log = new FileLog(paths.LogsDir);
+        FileLog.PruneOlderThanKeepDays(paths.SnapsDir, DateTime.Now);
         _settings = Settings.Load(paths.SettingsFile);
         Store = new StateStore(paths.StateDb);
         if (Store.RecoveredExporting > 0)
