@@ -30,7 +30,11 @@ public sealed class AvaprojectExporter
     private const string MetricTitle = "Export Dimensional Values";
     private const string SaveProjectTitle = "Save Project";
     private const int FileMenuX = 47, FileMenuY = 11;
-    private const int SaveDialogFileNameId = 1001, SaveDialogSaveId = 1, SaveProjectNoId = 7;
+    private const int SaveDialogFileNameId = 1001, SaveDialogSaveId = 1, SaveProjectNoId = 7, CancelId = 2;
+    private const string ExportDialogPrefix = "Export Project to ";
+    private const int MenuAttempts = 3;
+    private const int KeyDelay = 500;
+    private static readonly TimeSpan DialogWait = TimeSpan.FromSeconds(15);
 
     /// <summary>Visible window classes AVAproject (or Windows' text input in its process) shows in normal work.</summary>
     private static readonly HashSet<string> KnownClasses = new(StringComparer.Ordinal)
@@ -149,18 +153,9 @@ public sealed class AvaprojectExporter
             Enter("menu");
             var dock = Windows.Children(mdi).FirstOrDefault(c => c.Class == DockClass && c.Title == "DockTop").Handle;
             if (dock == IntPtr.Zero) throw new ExportFailure("menu: menu bar not found");
-            var file = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(), onWait: attempt =>
-            {
-                if (attempt % 20 == 0) Windows.PostClick(dock, FileMenuX, FileMenuY); // first try, then every 5 s
-            });
-            Windows.PostKey(file, Native.VK_E);
-            var export = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(h => h != file));
-            Windows.PostKey(export, Native.VK_DOWN);
-            Thread.Sleep(300);
-            Windows.PostKey(export, Native.VK_RETURN);
+            var dlg = OpenAccessExportDialog(dock);
 
             Enter("save dialog");
-            var dlg = WaitFor(StepTimeout, wins => wins.FirstOrDefault(w => w.Class == DialogClass && w.Title == SaveDialogTitle).Handle);
             var edit = Windows.ChildById(dlg, SaveDialogFileNameId, "Edit");
             var save = Windows.ChildById(dlg, SaveDialogSaveId, "Button");
             if (edit == IntPtr.Zero || save == IntPtr.Zero) throw new ExportFailure("save dialog: file name box or Save button not found");
@@ -180,6 +175,55 @@ public sealed class AvaprojectExporter
             Move();
             Enter("done");
         }
+
+        /// <summary>
+        /// File → Export Project → Microsoft Access (.mdb), retried up to <see cref="MenuAttempts"/> times. Posted keys
+        /// can be dropped while a popup is still opening; a dropped Down picks "Ascii Text" instead. A wrong export
+        /// dialog is cancelled and the menu retried; menus left open are closed with Escape before a retry.
+        /// </summary>
+        private IntPtr OpenAccessExportDialog(IntPtr dock)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                var file = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(), onWait: n =>
+                {
+                    if (n % 20 == 0) Windows.PostClick(dock, FileMenuX, FileMenuY); // first try, then every 5 s
+                });
+                Thread.Sleep(KeyDelay);
+                Windows.PostKey(file, Native.VK_E);
+                var export = WaitFor(StepTimeout, wins => Popups(wins).FirstOrDefault(h => h != file));
+                Thread.Sleep(KeyDelay);
+                Windows.PostKey(export, Native.VK_DOWN);
+                Thread.Sleep(KeyDelay);
+                Windows.PostKey(export, Native.VK_RETURN);
+
+                var outcome = WaitFor(DialogWait, wins =>
+                {
+                    var d = wins.FirstOrDefault(w => w.Class == DialogClass && w.Title.StartsWith(ExportDialogPrefix, StringComparison.Ordinal));
+                    return d.Handle;
+                }, extraKnown: IsAnyExportDialog, timeoutReturnsZero: true);
+
+                if (outcome != IntPtr.Zero && Windows.Text(outcome) == SaveDialogTitle) return outcome;
+                if (attempt >= MenuAttempts)
+                    throw new ExportFailure(outcome == IntPtr.Zero
+                        ? $"menu: export dialog did not open after {MenuAttempts} tries"
+                        : $"menu: wrong export dialog '{Windows.Text(outcome)}' after {MenuAttempts} tries");
+
+                if (outcome != IntPtr.Zero)
+                {
+                    var cancel = Windows.ChildById(outcome, CancelId, "Button");
+                    if (cancel != IntPtr.Zero) Native.PostMessage(cancel, Native.BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                    else Native.PostMessage(outcome, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                }
+                // Close any menus still open, then wait for the main window to be alone again.
+                foreach (var popup in Windows.TopLevel(_x._desktop.Handle, _proc!.Id).Where(w => w.Class == PopupClass))
+                    Windows.PostKey(popup.Handle, Native.VK_ESCAPE);
+                WaitFor(StepTimeout, wins => wins.Any(w => w.Class == PopupClass || IsAnyExportDialog(w)) ? IntPtr.Zero : (IntPtr)1,
+                    extraKnown: IsAnyExportDialog);
+            }
+        }
+
+        private static bool IsAnyExportDialog(Win w) => w.Class == DialogClass && w.Title.StartsWith(ExportDialogPrefix, StringComparison.Ordinal);
 
         /// <summary>After Save: answer the metric dialog once if it appears, then wait until the .mdb is complete.</summary>
         private void WaitForExport(long apjBytes)
@@ -266,14 +310,15 @@ public sealed class AvaprojectExporter
         /// Fails on timeout, on the process exiting, on a window leaking to the user's desktop, or on an unknown window
         /// that stays up for <see cref="UnknownWindowGrace"/> (snapshot saved).
         /// </summary>
-        private IntPtr WaitFor(TimeSpan timeout, Func<List<Win>, IntPtr> check, Action<int>? onWait = null, Func<Win, bool>? extraKnown = null)
+        private IntPtr WaitFor(TimeSpan timeout, Func<List<Win>, IntPtr> check, Action<int>? onWait = null, Func<Win, bool>? extraKnown = null,
+            bool timeoutReturnsZero = false)
         {
             var deadline = DateTime.UtcNow + timeout;
             for (var attempt = 0; ; attempt++)
             {
                 _ct.ThrowIfCancellationRequested();
                 if (_proc!.HasExited)
-                    throw new ExportFailure($"{Step}: AVAproject exited (code 0x{_proc.ExitCode:X8})");
+                    throw new ExportFailure($"{Step}: AVAproject exited ({ExitCodeText(_proc)})");
                 if (_x._userDesktop != IntPtr.Zero && Windows.HasVisibleWindow(_x._userDesktop, _proc.Id))
                     throw new ExportFailure($"{Step}: AVAproject window leaked to the user desktop");
 
@@ -281,6 +326,7 @@ public sealed class AvaprojectExporter
                 CheckUnknown(wins, extraKnown);
                 var found = check(wins);
                 if (found != IntPtr.Zero) return found;
+                if (DateTime.UtcNow >= deadline && timeoutReturnsZero) return IntPtr.Zero;
                 if (DateTime.UtcNow >= deadline)
                     throw new ExportFailure($"{Step}: timed out after {timeout.TotalMinutes:0.#} min", Snap(wins.FirstOrDefault().Handle, "timeout"));
                 onWait?.Invoke(attempt);
@@ -324,6 +370,12 @@ public sealed class AvaprojectExporter
             var bad = Path.GetInvalidFileNameChars();
             var cleaned = new string(s.Select(c => bad.Contains(c) ? '_' : c).ToArray());
             return cleaned.Length > 80 ? cleaned[..80] : cleaned;
+        }
+
+        private static string ExitCodeText(Process p)
+        {
+            try { return $"code 0x{p.ExitCode:X8}"; }
+            catch (InvalidOperationException) { return "exit code unknown"; }
         }
 
         private static IEnumerable<IntPtr> Popups(List<Win> wins) => wins.Where(w => w.Class == PopupClass).Select(w => w.Handle);

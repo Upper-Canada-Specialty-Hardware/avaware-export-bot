@@ -68,7 +68,7 @@ internal static class Native
     public const uint WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101;
     public const uint WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202;
     public const uint BM_GETCHECK = 0x00F0, BM_CLICK = 0x00F5;
-    public const int VK_RETURN = 0x0D, VK_DOWN = 0x28, VK_E = 0x45;
+    public const int VK_RETURN = 0x0D, VK_ESCAPE = 0x1B, VK_DOWN = 0x28, VK_E = 0x45;
     public const int MK_LBUTTON = 0x0001;
 
     [DllImport("user32.dll", SetLastError = true)]

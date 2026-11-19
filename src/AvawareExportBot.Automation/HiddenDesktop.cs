@@ -52,7 +52,11 @@ public sealed class HiddenDesktop : IDisposable
                 throw new Win32Exception(Marshal.GetLastWin32Error(), $"CreateProcess({exePath}) failed");
             try
             {
-                return Process.GetProcessById(pi.dwProcessId);
+                var proc = Process.GetProcessById(pi.dwProcessId);
+                // Open the Process object's own handle now, while the process is alive (ours is still open, so its
+                // id cannot be reused): without it, ExitCode cannot be read after the process exits.
+                _ = proc.Handle;
+                return proc;
             }
             finally
             {
