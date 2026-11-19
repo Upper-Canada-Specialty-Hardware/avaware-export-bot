@@ -1,13 +1,21 @@
 name: Release
 
 on:
-  # Installed apps update themselves from the exe and checksum this attaches to each published release.
-  # Cut a release with: gh release create vX.Y.Z --generate-notes
+  # Every merge to main is released as the next patch version, and installed apps update themselves from it.
+  push:
+    branches: [main]
+  # A release published by hand (to bump the minor or major, e.g. gh release create v0.2.0 --generate-notes)
+  # is built and gets its assets attached the same way. Later merges continue from its version.
   release:
     types: [published]
 
 permissions:
-  contents: write # attach the assets to the release
+  contents: write # create releases and attach their assets
+
+# One release at a time, never cancelled, so two runs can't pick the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -15,44 +23,88 @@ jobs:
     # Linux: the Windows desktop app cross-publishes here through EnableWindowsTargeting; nothing needs Windows to run.
     runs-on: ${{ vars.UCSH_LINUX || 'ubuntu-latest' }}
     timeout-minutes: 15
-    env:
-      TAG: ${{ github.event.release.tag_name }}
     steps:
-      - name: Check the tag
-        run: |
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tag '$TAG' is not vX.Y.Z (for example v1.2.3). Delete the release and publish it again with a vX.Y.Z tag."
-            exit 1
-          fi
-          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
-
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+          fetch-depth: 0 # every tag, to pick the next version
+
+      - name: Pick the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$EVENT" = release ]; then
+            tag="$RELEASE_TAG"
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Release tag '$tag' is not vX.Y.Z (for example v1.2.3). Delete the release and publish it again with a vX.Y.Z tag."
+              exit 1
+            fi
+          else
+            released=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+            if [ -n "$released" ]; then
+              echo "::notice::$GITHUB_SHA is already released as $released; nothing to publish."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tag=$(git tag --list | bash .github/scripts/next-version.sh)
+          fi
+          echo "Releasing $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-dotnet@v6
+        if: steps.version.outputs.skip != 'true'
         with:
           global-json-file: global.json
           cache: true
           cache-dependency-path: '**/packages.lock.json'
 
       - name: Restore
+        if: steps.version.outputs.skip != 'true'
         run: dotnet restore --locked-mode
 
       - name: Test
+        if: steps.version.outputs.skip != 'true'
         run: dotnet test --no-restore -c Release
 
       - name: Publish
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: >
           dotnet publish src/AvawareExportBot.App --no-restore -c Release -r win-x64 --self-contained false
           -p:PublishSingleFile=true -p:Version=${VERSION} -p:AutoUpdateBuild=true -o publish
 
       - name: Checksum
+        if: steps.version.outputs.skip != 'true'
         working-directory: publish
         run: sha256sum AvawareExportBot.exe > AvawareExportBot.exe.sha256 && cat AvawareExportBot.exe.sha256
 
-      - name: Attach to the release
+      # A merge: create the release as a draft with both assets, then publish it, so apps never see a latest
+      # release without its exe (the latest-release API skips drafts). A release published with this workflow's
+      # token starts no other workflow run, so this one does it all.
+      - name: Publish the release
+        if: github.event_name == 'push' && steps.version.outputs.skip != 'true'
         working-directory: publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # A draft left by a run that failed between the two steps below holds this tag; replace it.
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$TAG" AvawareExportBot.exe AvawareExportBot.exe.sha256 --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "$TAG" --generate-notes --draft
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      # A release published by hand: attach the assets to it.
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        working-directory: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: gh release upload "$TAG" AvawareExportBot.exe AvawareExportBot.exe.sha256 --clobber --repo "$GITHUB_REPOSITORY"

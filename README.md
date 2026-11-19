@@ -25,18 +25,24 @@ The app keeps itself up to date from this repository's releases:
 - **Update automatically** in Settings turns this off; **Check for updates** still works.
 - Only exes built by the release workflow update themselves. A build you make yourself shows "Dev build, updates off".
 
-## Cutting a release
+## Releases
 
-```
-gh release create vX.Y.Z --generate-notes
-```
+**Every merge to `main` is released.** [`release.yml`](.github/workflows/release.yml) runs on the merge, then:
 
-You can also publish a release in the GitHub web UI. The tag must be `vX.Y.Z`, and versions must go up.
-
-- Publishing the release runs [`release.yml`](.github/workflows/release.yml). It runs the tests, builds the exe with that version, and attaches `AvawareExportBot.exe` and `AvawareExportBot.exe.sha256` to the release within a few minutes.
+- It picks the next patch version: the highest `vX.Y.Z` tag plus one (`v0.1.0` first, then `v0.1.1`, `v0.1.2`, …).
+- It runs the tests and builds the exe with that version.
+- It publishes the release, with `AvawareExportBot.exe`, `AvawareExportBot.exe.sha256` and notes generated from the merged pull requests, within a few minutes.
 - Installed apps pick it up at their next check (within 6 hours) or from **Check for updates**.
-- If the workflow fails (a failing test, or a tag that isn't `vX.Y.Z`), nothing is attached, so installed apps stay where they are.
-- A **prerelease** is built too but never installed: apps only look at the latest full release.
+
+If a run fails (a failing test, say), nothing is published and no version number is used up: the next merge takes the same number.
+
+**To bump the minor or major version**, publish a release by hand with a higher tag:
+
+```
+gh release create v0.2.0 --generate-notes
+```
+
+The same workflow builds it and attaches the exe and checksum, and later merges continue from it (`v0.2.1`, …). You can also publish it in the GitHub web UI. Tags must be `vX.Y.Z` and versions only go up; a tag lower than the latest is ignored by installed apps. A **prerelease** is built too but never installed: apps only look at the latest full release.
 
 ## How it runs
 
