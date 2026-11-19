@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Drives AVAproject on hidden desktops through Win32. The only project with P/Invoke. -->
+  <PropertyGroup>
+    <TargetFramework>net7.0-windows</TargetFramework>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AvawareExportBot.Core\AvawareExportBot.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- PrintWindow failure screenshots are saved as PNG. -->
+    <PackageReference Include="System.Drawing.Common" Version="7.0.0" />
+  </ItemGroup>
+
+</Project>
