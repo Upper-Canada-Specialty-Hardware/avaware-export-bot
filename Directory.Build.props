@@ -1,0 +1,12 @@
+<Project>
+  <!-- Shared by every project. EnableWindowsTargeting lets the net7.0-windows projects build on the Linux CI runner. -->
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <LangVersion>latest</LangVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- packages.lock.json files are committed: CI restores exactly them and keys its NuGet cache on them. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+</Project>

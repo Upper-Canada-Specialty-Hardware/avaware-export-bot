@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net7.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>AvawareExportBot</AssemblyName>
+    <RootNamespace>AvawareExportBot.App</RootNamespace>
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AvawareExportBot.Core\AvawareExportBot.Core.csproj" />
+    <ProjectReference Include="..\AvawareExportBot.Automation\AvawareExportBot.Automation.csproj" />
+  </ItemGroup>
+
+</Project>
