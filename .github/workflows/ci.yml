@@ -34,6 +34,10 @@ jobs:
       - name: Test
         run: dotnet test --no-build -c Release --verbosity normal
 
+      # The version picking the release workflow does on every merge to main.
+      - name: Test the release version script
+        run: bash .github/scripts/next-version.test.sh
+
       # The same publish the release workflow runs, so a release is never the first time it is tried.
       - name: Publish
         run: >
