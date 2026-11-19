@@ -8,5 +8,7 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <!-- packages.lock.json files are committed: CI restores exactly them and keys its NuGet cache on them. -->
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- A local build reads as 0.0.0; the release workflow sets the real version from the release tag. -->
+    <VersionPrefix>0.0.0</VersionPrefix>
   </PropertyGroup>
 </Project>

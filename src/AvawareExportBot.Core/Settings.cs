@@ -15,6 +15,9 @@ public sealed class Settings
     public int RescanMinutes { get; set; } = 60;
     public int MaxAttempts { get; set; } = 3;
 
+    /// <summary>Check for, download and apply new releases by themselves. A settings file from before this existed reads as on.</summary>
+    public bool AutoUpdate { get; set; } = true;
+
     /// <summary>One worker per logical core minus one, at least one.</summary>
     public static int DefaultWorkers => Math.Max(1, Environment.ProcessorCount - 1);
 

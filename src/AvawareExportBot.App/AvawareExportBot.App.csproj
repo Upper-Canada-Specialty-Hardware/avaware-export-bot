@@ -7,7 +7,17 @@
     <AssemblyName>AvawareExportBot</AssemblyName>
     <RootNamespace>AvawareExportBot.App</RootNamespace>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
+    <!-- The release is a win-x64 single-file exe. Listing the runtime here makes the committed lock file cover it,
+         so the release workflow's locked restore works. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <!-- Bundle the SQLite native library into the one exe, so the release is a single file the updater can swap. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
+
+  <!-- Only the release workflow passes -p:AutoUpdateBuild=true. A build without it is a dev build and never updates itself. -->
+  <ItemGroup Condition="'$(AutoUpdateBuild)' == 'true'">
+    <AssemblyMetadata Include="AutoUpdateBuild" Value="true" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\AvawareExportBot.Core\AvawareExportBot.Core.csproj" />

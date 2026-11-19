@@ -23,7 +23,8 @@ public sealed record ControllerSnapshot(
     bool Scanning,
     ScanProgress? ScanProgress,
     DateTime? LastScanFinishedUtc,
-    DateTime? NextScanUtc);
+    DateTime? NextScanUtc,
+    bool UpdateHold = false);
 
 /// <summary>
 /// Decides when exports and scans start. Call <see cref="Tick"/> about once a second from a background timer.
@@ -76,6 +77,7 @@ public sealed class RunController
     private DateTime? _lastScanFinished;
     private StatusCounts _counts = new(0, 0, 0, 0);
     private bool _shuttingDown;
+    private bool _updateHold;
 
     private sealed class Slot
     {
@@ -87,8 +89,12 @@ public sealed class RunController
         public Task? Task { get; set; }
     }
 
-    public RunController(StateStore store, IExportRunner runner, IScanRunner scanner, IIdleSource idle, IClock clock, ILog log, Func<Settings> settings)
+    /// <param name="initialState">The state to start in: Armed for a plain launch, or the state an updated app had
+    /// (see <see cref="Updates.RestartArgs.StartStateAfter"/>; IdleRunning is never a start state and becomes Armed).</param>
+    public RunController(StateStore store, IExportRunner runner, IScanRunner scanner, IIdleSource idle, IClock clock, ILog log, Func<Settings> settings,
+        RunState initialState = RunState.Armed)
     {
+        _state = Updates.RestartArgs.StartStateAfter(initialState);
         _store = store;
         _runner = runner;
         _scanner = scanner;
@@ -110,6 +116,22 @@ public sealed class RunController
     public int RunningExports
     {
         get { lock (_gate) return _slots.Count(s => s is not null); }
+    }
+
+    /// <summary>
+    /// Set while an update is waiting to be applied: no new exports or scans start, whatever the state, so the running
+    /// ones drain. The user's state is untouched, so Start, Pause and Stop work as usual underneath it.
+    /// </summary>
+    public bool UpdateHold
+    {
+        get { lock (_gate) return _updateHold; }
+        set { lock (_gate) _updateHold = value; }
+    }
+
+    /// <summary>No export and no scan is running, so the app can restart without cutting anything off.</summary>
+    public bool IsDrained
+    {
+        get { lock (_gate) return _scanTask is null && _slots.All(s => s is null); }
     }
 
     /// <summary>The user's Start button: run now, whatever the input.</summary>
@@ -161,7 +183,7 @@ public sealed class RunController
                 _lastInputMarker = marker;
             }
 
-            if (IsActive(_state))
+            if (IsActive(_state) && !_updateHold)
             {
                 if (_scanTask is null && ScanDue(now, settings)) StartScanLocked();
                 FillSlotsLocked(settings);
@@ -307,7 +329,7 @@ public sealed class RunController
             }).ToList();
             DateTime? next = _lastScanFinished?.AddMinutes(settings.RescanMinutes);
             return new ControllerSnapshot(_state, _idleTime, TimeSpan.FromMinutes(settings.IdleMinutes), workers, _counts,
-                _scanTask is not null, _scanProgress, _lastScanFinished, next);
+                _scanTask is not null, _scanProgress, _lastScanFinished, next, _updateHold);
         }
     }
 
